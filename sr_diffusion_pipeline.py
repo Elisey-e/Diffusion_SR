@@ -621,7 +621,7 @@ def setup_training(args):
     model = UNetSR(in_channels=6, base_channels=64).to(device)
     
     # Создаем оптимизатор
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.)
     
     # Создаем планировщик шума
     noise_scheduler = NoiseScheduler(num_timesteps=1000, device=device)
@@ -684,6 +684,7 @@ def train_epoch(model, train_loader, optimizer, noise_scheduler, device, scaler,
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         else:
             # Обычное обучение без смешанной точности
             loss = noise_scheduler.p_losses(model, hr_images, t, lr_upscaled)
@@ -694,6 +695,7 @@ def train_epoch(model, train_loader, optimizer, noise_scheduler, device, scaler,
             if (batch_idx + 1) % args.grad_accum_steps == 0 or (batch_idx + 1) == len(train_loader):
                 optimizer.step()
                 optimizer.zero_grad()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         # Обновляем статистику
         total_loss += loss.item() * args.grad_accum_steps

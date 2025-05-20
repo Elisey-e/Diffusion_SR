@@ -182,86 +182,97 @@ class AttentionBlock(nn.Module):
         return x + self.proj(out)
 
 
+# ---------------------------
+# 1. Энкодерный Down-блок
+# ---------------------------
 class DownBlock(nn.Module):
     def __init__(self, in_channels, out_channels, time_channels, has_attn=False):
         super().__init__()
-        self.res1 = ResidualBlock(in_channels, out_channels)
+        self.res1 = ResidualBlock(in_channels,  out_channels)
         self.res2 = ResidualBlock(out_channels, out_channels)
-        self.time_emb = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(time_channels, out_channels))
-        # Изменяем downsampling на более безопасный
-        self.downsample = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.AvgPool2d(2)
-        )
-        self.has_attn = has_attn
-        if has_attn:
-            self.attn = AttentionBlock(out_channels)
-    
-    def forward(self, x, time_emb):
-        x = self.res1(x)
-        x = self.res2(x) + self.time_emb(time_emb).unsqueeze(-1).unsqueeze(-1)
-        if self.has_attn:
-            x = self.attn(x)
-        return self.downsample(x), x
 
-
-class UpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, time_channels, has_attn=False):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-
-        # Первый ResidualBlock: входные каналы = in_channels + out_channels
-        self.res1 = ResidualBlock(in_channels + out_channels, out_channels)
-        # Второй ResidualBlock: входные каналы = out_channels + out_channels
-        self.res2 = ResidualBlock(out_channels + out_channels, out_channels)
-
-        # Таймэмбеддинг
         self.time_emb = nn.Sequential(
             nn.SiLU(),
             nn.Linear(time_channels, out_channels)
         )
 
-        # Upsample + свёртка
-        self.upsample = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='nearest'),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.has_attn = has_attn
+        if has_attn:
+            self.attn = AttentionBlock(out_channels)
+
+        # ↓2: AvgPool → Conv
+        self.downsample = nn.Sequential(
+            nn.AvgPool2d(2),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+        )
+
+    def forward(self, x, time_emb):
+        x = self.res1(x)
+        x = self.res2(x) + self.time_emb(time_emb).unsqueeze(-1).unsqueeze(-1)
+        if self.has_attn:
+            x = self.attn(x)
+
+        skip = x              # (B, C, H, W) — ДО downsample
+        x    = self.downsample(x)
+        return x, skip        # x ↓2,  skip — оригинал
+
+
+
+
+class UpBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+        time_channels: int,
+        has_attn: bool = False,
+    ):
+        super().__init__()
+
+        self.skip_proj = (
+            nn.Identity()
+            if skip_channels == out_channels
+            else nn.Conv2d(skip_channels, out_channels, kernel_size=1)
+        )
+
+        self.res1 = ResidualBlock(in_channels + out_channels, out_channels)
+        self.res2 = ResidualBlock(out_channels, out_channels)
+
+        self.time_emb = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_channels, out_channels),
         )
 
         self.has_attn = has_attn
         if has_attn:
             self.attn = AttentionBlock(out_channels)
 
-    def forward(self, x, skip_x, skip_x2, time_emb):
-        # Проекция skip_x к нужному пространственному размеру
-        if skip_x.shape[2:] != x.shape[2:]:
-            skip_x = F.interpolate(skip_x, size=x.shape[2:], mode='nearest')
-        # Проекция каналов skip_x → out_channels
-        if skip_x.size(1) != self.out_channels:
-            proj = nn.Conv2d(skip_x.size(1), self.out_channels, 1).to(skip_x.device)
-            skip_x = proj(skip_x)
+        self.upsample = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+        )
 
-        # Сначала конкатенируем x + skip_x
-        x = torch.cat([x, skip_x], dim=1)
+    def forward(self, x, skip, time_emb):
+        # 0. если spatial-размеры не совпадают → подгоняем skip
+        if skip.shape[2:] != x.shape[2:]:
+            skip = F.interpolate(skip, size=x.shape[2:], mode="nearest")
+
+        # 1. выравниваем каналы
+        skip = self.skip_proj(skip)
+
+        # 2. объединяем + два Res-блока
+        x = torch.cat([x, skip], dim=1)
         x = self.res1(x)
-
-        # То же для второго skip-connection
-        if skip_x2.shape[2:] != x.shape[2:]:
-            skip_x2 = F.interpolate(skip_x2, size=x.shape[2:], mode='nearest')
-        if skip_x2.size(1) != self.out_channels:
-            proj2 = nn.Conv2d(skip_x2.size(1), self.out_channels, 1).to(skip_x2.device)
-            skip_x2 = proj2(skip_x2)
-
-        x = torch.cat([x, skip_x2], dim=1)
         x = self.res2(x) + self.time_emb(time_emb).unsqueeze(-1).unsqueeze(-1)
 
+        # 3. (опц.) attention
         if self.has_attn:
             x = self.attn(x)
 
-        # Финальный апсемпл
+        # 4. апсемпл
         return self.upsample(x)
+
 
 
 
@@ -281,85 +292,111 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 
 class UNetSR(nn.Module):
-    def __init__(self, in_channels=6, base_channels=64, channel_mults=(1, 2, 4),  # Уменьшили множители каналов
-                 time_emb_dim=256, cond_channels=3):
+    """
+    U-Net для условной (LR→HR) диффузии Super-Resolution, построенный
+    на исправленных Down/Up-блоках.
+    """
+    def __init__(
+        self,
+        in_channels: int = 6,            # 3 канала LR + 3 канала cond
+        cond_channels: int = 3,
+        base_channels: int = 64,
+        channel_mults: tuple = (1, 2, 4),
+        time_emb_dim: int = 256,
+    ):
         super().__init__()
+
+        # ---------- time-embedding ----------
         self.time_embedding = nn.Sequential(
             SinusoidalPositionEmbeddings(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim)
+            nn.Linear(time_emb_dim, time_emb_dim),
         )
-        
-        # Входной слой
-        self.input_conv = nn.Conv2d(in_channels, base_channels, 3, padding=1)
-        self.cond_proj = nn.Conv2d(cond_channels, base_channels, 3, padding=1)
-        
-        # Down блоки - уменьшили количество
-        self.down_blocks = nn.ModuleList()
+
+        # ---------- входной блок ----------
+        self.input_conv = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+        self.cond_proj  = nn.Conv2d(cond_channels, base_channels, kernel_size=3, padding=1)
+
+        # ---------- энкодер ----------
+        self.down_blocks  = nn.ModuleList()
+        self.skip_channels = []                      # будем запоминать C каждого skip
         channels = base_channels
-        down_channels = [channels]
-        
-        for i, mult in enumerate(channel_mults):
+
+        for mult in channel_mults:                   # (1, 2, 4) …
             out_channels = base_channels * mult
-            # Только один down блок на каждый множитель каналов
             self.down_blocks.append(
-                DownBlock(channels, out_channels, time_emb_dim, has_attn=(i >= 1)))  # Включаем attention только на глубоких слоях
-            channels = out_channels
-            down_channels.append(channels)
-        
-        # Middle блок
+                DownBlock(
+                    in_channels  = channels,
+                    out_channels = out_channels,
+                    time_channels= time_emb_dim,
+                    has_attn     = mult >= 2,        # attention на средних/глубоких уровнях
+                )
+            )
+            self.skip_channels.append(out_channels)  # пригодится декодеру
+            channels = out_channels                  # для следующего уровня
+
+        # ---------- bottleneck ----------
         self.middle_block = nn.Sequential(
             ResidualBlock(channels, channels),
             AttentionBlock(channels),
-            ResidualBlock(channels, channels))
-        
-        # Up блоки
+            ResidualBlock(channels, channels),
+        )
+
+        # ---------- декодер ----------
         self.up_blocks = nn.ModuleList()
-        for i, mult in reversed(list(enumerate(channel_mults))):
-            out_channels = base_channels * mult
+        for mult in reversed(channel_mults):         # (4, 2, 1)
+            skip_ch   = self.skip_channels.pop()     # соответствующий энкодерный skip
+            out_ch    = skip_ch                      # хотим выйти на те же каналы
             self.up_blocks.append(
-                UpBlock(channels, out_channels, time_emb_dim, has_attn=(i >= 1)))
-            channels = out_channels
-        
-        # Выходной слой
+                UpBlock(
+                    in_channels   = channels,        # из предыдущего уровня
+                    skip_channels = skip_ch,
+                    out_channels  = out_ch,
+                    time_channels = time_emb_dim,
+                    has_attn      = mult >= 2,
+                )
+            )
+            channels = out_ch                        # для следующего up-уровня
+
+        # ---------- выход ----------
         self.output_conv = nn.Sequential(
-            nn.GroupNorm(32, channels),
+            nn.GroupNorm(min(32, channels), channels),
             nn.SiLU(),
-            nn.Conv2d(channels, 3, 3, padding=1))
-    
-    def forward(self, x, time, cond):
-        # Проверка входных размеров
-        assert x.size(2) >= 16 and x.size(3) >= 16, f"Input size too small: {x.shape}"
-        
-        time_emb = self.time_embedding(time)
-        cond_features = self.cond_proj(cond)
-        
-        x = torch.cat([x, cond], dim=1)
-        x = self.input_conv(x)
-        x = x + cond_features
-        
-        # Down блоки
-        skip_connections = []
-        for down_block in self.down_blocks:
-            skip_connections.append(x)
-            x, _ = down_block(x, time_emb)
-            # Логирование размеров для отладки
-            logger.debug(f"After down block: {x.shape}, skip: {skip_connections[-1].shape}")
-        
-        # Middle блок
+            nn.Conv2d(channels, 3, kernel_size=3, padding=1),
+        )
+
+    # -------- forward ---------
+    def forward(self, x_lr, time, cond):
+        """
+        x_lr  : (B, 3,  H,  W)  — зашумл. HR-тензор (в процессе диффузии)
+        cond  : (B, 3,  H,  W)  — bicubic-upsampled LR (условие)
+        time  : (B,)            — шаг t
+        """
+        # time-embedding
+        t_emb = self.time_embedding(time)
+
+        # объединяем вход с условием
+        x = torch.cat([x_lr, cond], dim=1)           # 6 каналов
+        x = self.input_conv(x) + self.cond_proj(cond)
+
+        # -------- энкодер --------
+        skips = []
+        for down in self.down_blocks:
+            x, skip = down(x, t_emb)
+            skips.append(skip)
+
+        # -------- bottleneck --------
         x = self.middle_block(x)
-        logger.debug(f"After middle block: {x.shape}")
-        
-        # Up блоки
-        for up_block in self.up_blocks:
-            skip_x = skip_connections.pop()
-            skip_x2 = skip_connections[-1] if len(skip_connections) > 0 else skip_x
-            logger.debug(f"Before up block: x={x.shape}, skip_x={skip_x.shape}, skip_x2={skip_x2.shape}")
-            x = up_block(x, skip_x, skip_x2, time_emb)
-            logger.debug(f"After up block: {x.shape}")
-        
+
+        # -------- декодер --------
+        for up in self.up_blocks:
+            skip = skips.pop()                       # соответствующий skip-коннект
+            x = up(x, skip, t_emb)
+
+        # -------- выход --------
         return self.output_conv(x)
+
 
 
 
@@ -578,13 +615,13 @@ def prepare_dataloaders(args):
 def setup_training(args):
     """Настраивает модель, оптимизатор и планировщик шума"""
     # Определяем устройство для обучения
-    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Создаем модель
     model = UNetSR(in_channels=6, base_channels=64).to(device)
     
     # Создаем оптимизатор
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.)
     
     # Создаем планировщик шума
     noise_scheduler = NoiseScheduler(num_timesteps=1000, device=device)
@@ -647,6 +684,7 @@ def train_epoch(model, train_loader, optimizer, noise_scheduler, device, scaler,
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         else:
             # Обычное обучение без смешанной точности
             loss = noise_scheduler.p_losses(model, hr_images, t, lr_upscaled)
@@ -657,6 +695,7 @@ def train_epoch(model, train_loader, optimizer, noise_scheduler, device, scaler,
             if (batch_idx + 1) % args.grad_accum_steps == 0 or (batch_idx + 1) == len(train_loader):
                 optimizer.step()
                 optimizer.zero_grad()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         # Обновляем статистику
         total_loss += loss.item() * args.grad_accum_steps
@@ -968,6 +1007,10 @@ def memory_cleanup():
     gc.collect()
     torch.cuda.empty_cache()
 
+
+# ================================
+# Основная функция для обучения модели
+# ================================
 
 # ================================
 # Основная функция для обучения модели
